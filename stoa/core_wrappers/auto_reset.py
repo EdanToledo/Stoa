@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import jax
+import jax.numpy as jnp
 from chex import PRNGKey
 
 from stoa.core_wrappers.wrapper import Wrapper, WrapperState, wrapper_state_replace
@@ -39,70 +40,20 @@ class AutoResetWrapper(Wrapper[State]):
     the source of randomness for automatic resets.
     """
 
-    def __init__(self, env: Environment, next_obs_in_extras: bool = False):
+    def __init__(self, env: Environment, keep_terminal: bool = False):
         """Initialize the AutoResetWrapper.
 
         Args:
             env: The environment to wrap.
-            next_obs_in_extras: If True, stores the terminal observation in
-                timestep.extras[NEXT_OBS_KEY_IN_EXTRAS]. Useful for algorithms
-                that need access to the true final observation in truncated episodes.
+            keep_terminal: If True, return terminal observations.
+                Otherwise, store the terminal observation in `timestep.extras[NEXT_OBS_KEY_IN_EXTRAS]`.
         """
         super().__init__(env)
-        self.next_obs_in_extras = next_obs_in_extras
-
-        if next_obs_in_extras:
-            self._maybe_add_obs_to_extras = add_obs_to_extras
-        else:
-            self._maybe_add_obs_to_extras = lambda timestep: timestep
-
-    def _auto_reset(self, state: State, timestep: TimeStep) -> Tuple[State, TimeStep]:
-        """Reset the environment and update the timestep with the new initial observation.
-
-        Called when an episode terminates. Generates a new random rng_key, resets the
-        environment, and replaces the terminal observation with the reset observation
-        while preserving other timestep properties (reward, done flag, etc.).
-
-        Args:
-            state: Current environment state (terminal).
-            timestep: Current timestep (terminal).
-
-        Returns:
-            Tuple of (new_state, updated_timestep) where:
-            - new_state is the reset environment state
-            - updated_timestep contains the reset observation but preserves
-              the terminal reward, done flag, and optionally the terminal
-              observation in extras.
-        """
-        # Generate new random key for reset
-        rng_key, _ = jax.random.split(state.rng_key)  # type: ignore
-        reset_state, reset_timestep = self._env.reset(rng_key)
-        reset_observation = reset_timestep.observation
-
-        # Preserve terminal observation in extras if requested
-        updated_timestep = self._maybe_add_obs_to_extras(timestep)
-
-        # Replace observation with the reset observation while preserving
-        # other timestep properties (reward, done, etc.)
-        updated_timestep = updated_timestep.replace(observation=reset_observation)  # type: ignore
-
-        return reset_state, updated_timestep
-
-    def _handle_non_terminal(self, state: State, timestep: TimeStep) -> Tuple[State, TimeStep]:
-        """Handle non-terminal timesteps by optionally adding observation to extras.
-
-        Args:
-            state: Current environment state.
-            timestep: Current timestep (non-terminal).
-
-        Returns:
-            Tuple of (state, timestep) with observation optionally added to extras.
-        """
-        return state, self._maybe_add_obs_to_extras(timestep)
+        self.keep_terminal = keep_terminal
 
     def reset(
-        self, rng_key: PRNGKey, env_params: Optional[EnvParams] = None
-    ) -> Tuple[State, TimeStep]:
+        self, rng_key: PRNGKey, env_params: EnvParams | None = None
+    ) -> tuple[State, TimeStep]:
         """Reset the environment.
 
         Args:
@@ -110,26 +61,25 @@ class AutoResetWrapper(Wrapper[State]):
             env_params: Optional environment parameters.
 
         Returns:
-            Tuple of (initial_state, initial_timestep). The initial_timestep
-            will have the observation added to extras if next_obs_in_extras is True.
+            Tuple of (initial_state, initial_timestep).
+            If self.keep_terminal is True, the initial state will be a tuple
+            where the second element indicates whether the state is terminal.
+            Otherwise, the initial_timestep will have the observation added to extras.
         """
-        # Reset the base environment
         state, timestep = self._env.reset(rng_key, env_params)
-
-        # Add observation to extras if requested (for consistency with step behavior)
-        timestep = self._maybe_add_obs_to_extras(timestep)
+        if self.keep_terminal:
+            state = (state, jnp.asarray(False))
+        else:
+            timestep = add_obs_to_extras(timestep)
         return state, timestep
 
     def step(
-        self,
-        state: State,
-        action: Action,
-        env_params: Optional[EnvParams] = None,
-    ) -> Tuple[State, TimeStep]:
-        """Step the environment with automatic resetting on termination.
+        self, state: State, action: Action, env_params: EnvParams | None = None
+    ) -> tuple[State, TimeStep]:
+        """Step the environment with automatic resetting on termination or truncation.
 
         If the episode terminates after the step, the environment is automatically
-        reset and the timestep observation is replaced with the reset observation.
+        reset and the terminal observation is replaced with the reset observation.
         The terminal reward and done flag are preserved in the timestep.
 
         Args:
@@ -147,18 +97,29 @@ class AutoResetWrapper(Wrapper[State]):
             - new_timestep is the stepped timestep, optionally with observation
               added to extras
         """
-        # Step the environment
-        state, timestep = self._env.step(state, action, env_params)
+        if self.keep_terminal:
+            state, done = state
 
-        state, timestep = jax.lax.cond(
-            timestep.done(),
-            self._auto_reset,
-            self._handle_non_terminal,
-            state,
-            timestep,
-        )
+            def auto_reset(state, _, env_params):
+                return self.reset(state.rng_key, env_params)
 
-        return state, timestep
+            def no_reset(state, action, env_params):
+                step_state, step_timestep = self._env.step(state, action, env_params)
+                return (step_state, step_timestep.done()), step_timestep
+
+            return jax.lax.cond(done, auto_reset, no_reset, state, action, env_params)
+        else:
+            state, timestep = self._env.step(state, action, env_params)
+            timestep = add_obs_to_extras(timestep)
+
+            def auto_reset(state, timestep, env_params):
+                # only keep observation from reset_timestep
+                reset_state, reset_timestep = self.reset(state.rng_key, env_params)
+                return reset_state, timestep.replace(observation=reset_timestep.observation)
+
+            return jax.lax.cond(
+                timestep.done(), auto_reset, lambda *args: args[:2], state, timestep, env_params
+            )
 
 
 @dataclass(custom_replace_fn=wrapper_state_replace)
@@ -166,29 +127,28 @@ class CachedAutoResetState(WrapperState):
     """State for cached auto-reset wrapper."""
 
     cached_state: State
-    cached_obs: Observation
+    cached_timestep: TimeStep
 
 
 class CachedAutoResetWrapper(Wrapper[CachedAutoResetState]):
     """Auto-reset wrapper that caches the initial reset for repeated use."""
 
-    def __init__(self, env: Environment, next_obs_in_extras: bool = False):
+    def __init__(self, env: Environment, keep_terminal: bool = False):
         super().__init__(env)
-        self._maybe_add_obs_to_extras = add_obs_to_extras if next_obs_in_extras else lambda x: x
+        self.keep_terminal = keep_terminal
 
     def reset(
         self, rng_key: PRNGKey, env_params: Optional[EnvParams] = None
     ) -> Tuple[CachedAutoResetState, TimeStep]:
         """Reset and cache the initial state and observation."""
-        base_state, timestep = self._env.reset(rng_key, env_params)
+        env_state, timestep = self._env.reset(rng_key, env_params)
+        state = CachedAutoResetState(env_state, env_state, timestep)
+        if self.keep_terminal:
+            state = (state, jnp.asarray(False))
+        else:
+            timestep = add_obs_to_extras(timestep)
 
-        state = CachedAutoResetState(
-            base_env_state=base_state,
-            cached_state=base_state,
-            cached_obs=timestep.observation,
-        )
-
-        return state, self._maybe_add_obs_to_extras(timestep)
+        return state, timestep
 
     def step(
         self,
@@ -197,31 +157,29 @@ class CachedAutoResetWrapper(Wrapper[CachedAutoResetState]):
         env_params: Optional[EnvParams] = None,
     ) -> Tuple[CachedAutoResetState, TimeStep]:
         """Step with cached auto-reset on episode termination."""
-        new_base_state, timestep = self._env.step(state.base_env_state, action, env_params)
 
-        def auto_reset(
-            s: CachedAutoResetState, ts: TimeStep
-        ) -> Tuple[CachedAutoResetState, TimeStep]:
-            # Use cached state and observation directly
-            new_state = CachedAutoResetState(
-                base_env_state=s.cached_state,
-                cached_state=s.cached_state,
-                cached_obs=s.cached_obs,
-            )
+        if self.keep_terminal:
+            state, done = state
 
-            # Store terminal obs in extras, then replace base observation with cached reset obs
-            updated_ts = self._maybe_add_obs_to_extras(ts).replace(observation=s.cached_obs)  # type: ignore
-            return new_state, updated_ts
+            def auto_reset(state, action, env_params):
+                state = state.replace(base_env_state=state.cached_state)
+                return (state, jnp.asarray(False)), state.cached_timestep
 
-        def no_reset(
-            s: CachedAutoResetState, ts: TimeStep
-        ) -> Tuple[CachedAutoResetState, TimeStep]:
-            new_state = CachedAutoResetState(
-                base_env_state=new_base_state,
-                cached_state=s.cached_state,
-                cached_obs=s.cached_obs,
-            )
-            return new_state, self._maybe_add_obs_to_extras(ts)
+            def no_reset(state, action, env_params):
+                env_state, step_timestep = self._env.step(state.base_env_state, action, env_params)
+                state = state.replace(base_env_state=env_state)
+                return (state, step_timestep.done()), step_timestep
 
-        state, timestep = jax.lax.cond(timestep.done(), auto_reset, no_reset, state, timestep)
-        return state, timestep
+            return jax.lax.cond(done, auto_reset, no_reset, state, action, env_params)
+
+        else:
+            env_state, timestep = self._env.step(state.base_env_state, action, env_params)
+            state = state.replace(base_env_state=env_state)
+            timestep = add_obs_to_extras(timestep)
+
+            def auto_reset(state, timestep):
+                state = state.replace(base_env_state=state.cached_state)
+                timestep = timestep.replace(observation=state.cached_timestep.observation)
+                return state, timestep
+
+            return jax.lax.cond(timestep.done(), auto_reset, lambda *args: args, state, timestep)

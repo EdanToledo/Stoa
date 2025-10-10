@@ -117,7 +117,7 @@ env = GymnaxToStoa(gymnax_env, env_params)
 
 # 3. Apply standard wrappers
 # Note: The order of wrappers matters.
-env = AutoResetWrapper(env, next_obs_in_extras=True)
+env = AutoResetWrapper(env, keep_terminal=False)
 env = RecordEpisodeMetrics(env)
 
 # JIT compile the reset and step functions for performance

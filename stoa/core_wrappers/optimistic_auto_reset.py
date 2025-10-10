@@ -1,13 +1,12 @@
-from typing import Optional, Tuple
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 from chex import PRNGKey
-from jax import Array
 
 from stoa.core_wrappers.auto_reset import add_obs_to_extras
 from stoa.core_wrappers.wrapper import Wrapper
-from stoa.env_types import Action, EnvParams, Observation, State, TimeStep
+from stoa.env_types import Action, EnvParams, State, TimeStep
 from stoa.environment import Environment
 
 
@@ -32,10 +31,9 @@ class OptimisticResetVmapWrapper(Wrapper[State]):
     """
 
     def __init__(
-        self, env: Environment, num_envs: int, reset_ratio: int, next_obs_in_extras: bool = False
+        self, env: Environment, num_envs: int, reset_ratio: int, keep_terminal: bool = False
     ):
         super().__init__(env)
-
         if num_envs <= 0:
             raise ValueError(f"num_envs must be positive, got {num_envs}")
         if num_envs % reset_ratio != 0:
@@ -44,112 +42,52 @@ class OptimisticResetVmapWrapper(Wrapper[State]):
             )
 
         self.num_envs = num_envs
-        self.reset_ratio = reset_ratio
         self.num_resets = num_envs // reset_ratio
-
-        self._vmap_reset = jax.vmap(self._env.reset, in_axes=(0, None), out_axes=(0, 0))
-        self._vmap_step = jax.vmap(self._env.step, in_axes=(0, 0, None), out_axes=(0, 0))
-
-        self.next_obs_in_extras = next_obs_in_extras
-        if next_obs_in_extras:
-            self._maybe_add_obs_to_extras = add_obs_to_extras
-        else:
-            self._maybe_add_obs_to_extras = lambda timestep: timestep
+        self._vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+        self._vmap_step = jax.vmap(env.step, in_axes=(0, 0, None))
+        self.keep_terminal = keep_terminal
 
     def reset(
-        self, rng_key: PRNGKey, env_params: Optional[EnvParams] = None
-    ) -> Tuple[State, TimeStep]:
-        """Resets all vectorized environments."""
-
-        # If rng_key is a single key, split it into num_envs keys
-        # else assume it has the shape (num_envs, ...)
-        if jnp.logical_or(rng_key.ndim == 1, rng_key.ndim == 0):
-            reset_keys = jax.random.split(rng_key, self.num_envs)
+        self, rng_key: PRNGKey, env_params: EnvParams | None = None
+    ) -> tuple[State, TimeStep]:
+        if rng_key.ndim == 1 if rng_key.dtype == jnp.uint32 else rng_key.ndim == 0:
+            rng_key = jax.random.split(rng_key, self.num_envs)
+        states, timesteps = self._vmap_reset(rng_key, env_params)
+        if self.keep_terminal:
+            states = (states, jnp.zeros_like(rng_key, dtype=jnp.bool_))
         else:
-            reset_keys = rng_key
-
-        # Reset all environments
-        states, timesteps = self._vmap_reset(reset_keys, env_params)
-
-        # For consistency, add the observation to extras if needed
-        timesteps = self._maybe_add_obs_to_extras(timesteps)
-
+            timesteps = add_obs_to_extras(timesteps)
         return states, timesteps
 
     def step(
-        self,
-        state: State,
-        action: Action,
-        env_params: Optional[EnvParams] = None,
-    ) -> Tuple[State, TimeStep]:
-        """Steps all vectorized environments with optimistic auto-resets."""
-        # Step all environments
-        new_states, timesteps = self._vmap_step(state, action, env_params)
+        self, state: State, action: Action, env_params: EnvParams | None = None
+    ) -> tuple[State, TimeStep]:
+        if self.keep_terminal:
+            env_states, dones = state
+        else:
+            env_states = state
 
-        # Add the observation to extras if needed
-        timesteps = self._maybe_add_obs_to_extras(timesteps)
-
-        # Extract done flags and handle RNG keys for resets
-        dones = timesteps.done()
-
-        # Get RNG keys for reset generation and selection
-        reset_keys_parent = new_states.rng_key
-
-        # Get new RNG keys for resets
-        reset_keys_base, reset_keys_select = jax.vmap(jax.random.split, out_axes=1)(
-            reset_keys_parent
+        # get the reset states and stepped states
+        reset_keys, state_keys = jax.vmap(jax.random.split, out_axes=1)(env_states.rng_key)
+        env_states = env_states.replace(rng_key=state_keys)
+        step_states, step_timesteps = self._vmap_step(env_states, action, env_params)
+        env_to_reset_index = jax.random.choice(
+            shape=(self.num_envs,), a=self.num_resets, key=reset_keys[self.num_resets]
         )
-        new_states = new_states.replace(rng_key=reset_keys_base)
-
-        # Get num_resets reset keys
-        reset_keys = reset_keys_select[: self.num_resets]
-        # Perform env reset to get reset states and timesteps
-        reset_states, reset_timesteps = self._vmap_reset(reset_keys, env_params)
-
-        # Assign reset states to environments
-        # First, create default assignments (each reset state maps to reset_ratio environments)
-        reset_indices = jnp.arange(self.num_resets).repeat(self.reset_ratio)
-
-        # Use next available key
-        rng_key_choice = reset_keys_select[self.num_resets]
-        # Use weighted random selection to choose which environments get reset
-        being_reset = jax.random.choice(
-            rng_key_choice,
-            jnp.arange(self.num_envs),
-            shape=(self.num_resets,),
-            p=dones.astype(jnp.float32),
-            replace=False,
+        reset_states, reset_timesteps = jax.tree.map(
+            lambda x: x[env_to_reset_index],
+            self.reset(reset_keys[: self.num_resets], env_params),
         )
 
-        # Update reset_indices so selected environments map to unique reset states
-        reset_indices = reset_indices.at[being_reset].set(jnp.arange(self.num_resets))
+        if self.keep_terminal:
+            step_states = (step_states, step_timesteps.done())
+        else:
+            step_timesteps = add_obs_to_extras(step_timesteps)
+            dones = step_timesteps.done()
+            reset_timesteps = step_timesteps.replace(observation=reset_timesteps.observation)
 
-        # Gather the reset states and timesteps according to the mapping
-        reset_states = jax.tree_map(lambda x: x[reset_indices], reset_states)
-        reset_timesteps = jax.tree_map(lambda x: x[reset_indices], reset_timesteps)
+        tree_where = lambda done, x, y: jax.tree.map(partial(jnp.where, done), x, y)
+        states = jax.vmap(tree_where)(dones, reset_states, step_states)
+        timesteps = jax.vmap(tree_where)(dones, reset_timesteps, step_timesteps)
 
-        # Auto-reset: select between stepped state and reset state based on done flag
-        def auto_reset(
-            done: Array,
-            state_reset: State,
-            state_step: State,
-            obs_reset: Observation,
-            obs_step: Observation,
-        ) -> Tuple[State, Observation]:
-            state = jax.tree.map(lambda x, y: jax.lax.select(done, x, y), state_reset, state_step)
-            obs = jax.lax.select(done, obs_reset, obs_step)
-            return state, obs
-
-        # Extract observations from reset and stepped timesteps
-        reset_observations = reset_timesteps.observation
-        stepped_observations = timesteps.observation
-
-        # Vectorized auto-reset across all environments
-        final_states, final_observations = jax.vmap(auto_reset)(
-            dones, reset_states, new_states, reset_observations, stepped_observations
-        )
-
-        # Create new timestep with final observations
-        final_timesteps = timesteps.replace(observation=final_observations)  # type: ignore
-
-        return final_states, final_timesteps
+        return states, timesteps
