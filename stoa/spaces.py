@@ -329,7 +329,7 @@ class BoundedArraySpace(ArraySpace):
 class DiscreteSpace(BoundedArraySpace):
     """Describes a discrete scalar space with values from 0 to num_values-1."""
 
-    def __init__(self, num_values: int, dtype: DTypeLike = int, name: str = "") -> None:
+    def __init__(self, num_values: int, dtype: DTypeLike = int, name: str = "", shape=()) -> None:
         """Initializes a new `DiscreteSpace`.
 
         Args:
@@ -348,7 +348,7 @@ class DiscreteSpace(BoundedArraySpace):
             raise ValueError(f"`dtype` must be an integer type, got {dtype}")
 
         super().__init__(
-            shape=(),  # Discrete spaces are scalar
+            shape=shape,  # Discrete spaces are scalar
             dtype=dtype,
             minimum=0,
             maximum=num_values - 1,
@@ -357,9 +357,7 @@ class DiscreteSpace(BoundedArraySpace):
         self._num_values = num_values
 
     def __repr__(self) -> str:
-        return (
-            f"DiscreteSpace(num_values={self.num_values}, dtype={self.dtype}, name={self.name!r})"
-        )
+        return f"DiscreteSpace(num_values={self.num_values}, shape={self.shape}, dtype={self.dtype}, name={self.name!r})"
 
     def __eq__(self, other: Any) -> bool:
         """Check equality with another space."""
